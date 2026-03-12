@@ -6,6 +6,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
+from aiohttp import web
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -67,7 +68,6 @@ async def set_user_data(user_id: int, queues: list[str], address: str = None):
 # --- ХЕНДЛЕРИ КОМАНД ---
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    # Приклад використання БД: ініціалізуємо користувача з порожнім списком черг, якщо його немає
     user_data = await get_user_data(message.from_user.id)
     if not user_data:
         await set_user_data(message.from_user.id, [])
@@ -75,15 +75,35 @@ async def cmd_start(message: Message):
     text = (
         f"💡 *Привіт, {message.from_user.first_name}!*\n\n"
         f"Я *Люмос* — допоможу тобі дізнаватись про відключення першим!\n\n"
-        f"⚡ Бот у розробці (додано MongoDB). Слідкуй за оновленнями!"
+        f"⚡ Бот у розробці. Слідкуй за оновленнями!"
     )
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
+# --- ВЕБ-СЕРВЕР ---
+async def handle_index(request):
+    """Головна сторінка"""
+    return web.Response(text="Lumos Bot is running! (aiohttp server ok)", content_type="text/plain")
+
+async def start_web_server():
+    """Запуск веб-сервера aiohttp"""
+    app = web.Application()
+    app.router.add_get("/", handle_index)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info(f"🌐 Web server started on port {PORT}")
 
 async def main():
     logging.info("🤖 Bot starting...")
     await init_db()
+    
     try:
+        # Запускаємо веб-сервер
+        await start_web_server()
+        
+        # Запускаємо бота
         await dp.start_polling(bot)
     finally:
         await close_db()
