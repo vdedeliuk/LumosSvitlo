@@ -66,6 +66,48 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# --- ФОРМАТУВАННЯ (LUM-11) ---
+def format_notification(queue_id: str, schedule: list, is_update: bool = False) -> str:
+    """Форматування для Івано-Франківська"""
+    header = "⚡️ *Оновлення графіку!*" if is_update else "📊 *Поточний графік*"
+    lines = [f"{header}\n", f"📍 *Черга:* {queue_id}\n"]
+    
+    if not schedule:
+        lines.append("✅ Відключень не заплановано.")
+        return "\n".join(lines)
+    
+    for day in schedule:
+        date = day.get("date", "")
+        hours = day.get("hours", [])
+        if not hours: continue
+        
+        lines.append(f"📅 *{date}:*")
+        for h in hours:
+            lines.append(f"• {h}")
+        lines.append("")
+        
+    return "\n".join(lines).strip()
+
+def format_lviv_notification(queue_id: str, slots: dict, is_update: bool = False) -> str:
+    """Форматування для Львова"""
+    header = "⚡️ *Оновлення графіку (Львів)!*" if is_update else "📊 *Поточний графік (Львів)*"
+    lines = [f"{header}\n", f"📍 *Черга:* {queue_id}\n"]
+    
+    if not slots:
+        lines.append("✅ Відключень не заплановано.")
+        return "\n".join(lines)
+        
+    for date_str, groups in slots.items():
+        times = groups.get(queue_id, [])
+        if not times: continue
+        
+        lines.append(f"📅 *{date_str}:*")
+        for start, end in times:
+            lines.append(f"• {start} — {end}")
+        lines.append("")
+        
+    return "\n".join(lines).strip()
+
 # --- MongoDB ---
 mongo_client: AsyncIOMotorClient = None
 db = None
@@ -98,8 +140,7 @@ async def set_user_data(user_id: int, queues: list[str], address: str = None, re
 
 async def get_users_by_queue(queue: str, region: str = None) -> list[int]:
     query = {"queues": queue}
-    if region:
-        query["region"] = region
+    if region: query["region"] = region
     cursor = db.users.find(query)
     users = await cursor.to_list(length=None)
     return [user["user_id"] for user in users]
@@ -115,17 +156,15 @@ async def save_schedule_state(queue_id: str, data_hash: str):
         upsert=True,
     )
 
-# --- МОНІТОРИНГ (LUM-8) ---
+# --- МОНІТОРИНГ ---
 async def scheduled_checker():
-    """Моніторинг графіків Івано-Франківська"""
-    logging.info("🚀 [ІФ] Scheduled checker started")
+    """Моніторинг Івано-Франківська"""
     while True:
         try:
             async with AsyncSession(impersonate="chrome120", proxy=PROXY_URL) as session:
                 for q in QUEUES:
                     data = await fetch_schedule(session, q)
                     if data is None: continue
-                    
                     queue_id, schedule = extract_queue_from_response(data)
                     if not queue_id: continue
                     
@@ -133,53 +172,42 @@ async def scheduled_checker():
                     old_hash = await get_schedule_state(queue_id)
                     
                     if old_hash and old_hash != data_hash:
-                        logging.info(f"🆕 [ІФ] Schedule changed for {queue_id}")
+                        text = format_notification(queue_id, schedule, is_update=True)
                         users = await get_users_by_queue(queue_id, region=REGION_IF)
                         for user_id in users:
-                            try:
-                                await bot.send_message(user_id, f"⚡️ *Оновлення графіку для черги {queue_id}*!", parse_mode=ParseMode.MARKDOWN)
+                            try: await bot.send_message(user_id, text, parse_mode=ParseMode.MARKDOWN)
                             except: pass
-                    
                     await save_schedule_state(queue_id, data_hash)
-                    await asyncio.sleep(1) # Пауза між запитами черг
+                    await asyncio.sleep(1)
         except Exception as e:
             logging.error(f"Error in scheduled_checker: {e}")
-        
         await asyncio.sleep(CHECK_INTERVAL)
 
 async def lviv_scheduled_checker():
-    """Моніторинг графіків Львова"""
-    logging.info("🚀 [ЛОЕ] Lviv scheduled checker started")
+    """Моніторинг Львова"""
     while True:
         try:
             all_schedules = await fetch_lviv_schedule()
             if all_schedules:
-                # В ЛОЕ зазвичай один хеш для всього регіону або по чергах. 
-                # Спрощено: перевіряємо кожну чергу окремо.
                 for q in QUEUES:
-                    # Збираємо дані для конкретної черги за всі доступні дати
                     q_data = {d: all_schedules[d].get(q, []) for d in all_schedules}
                     data_hash = hashlib.md5(json.dumps(q_data, sort_keys=True).encode()).hexdigest()
-                    
                     lviv_q_id = f"lviv_{q}"
                     old_hash = await get_schedule_state(lviv_q_id)
                     
                     if old_hash and old_hash != data_hash:
-                        logging.info(f"🆕 [ЛОЕ] Schedule changed for {q}")
+                        text = format_lviv_notification(q, all_schedules, is_update=True)
                         users = await get_users_by_queue(q, region=REGION_LVIV)
                         for user_id in users:
-                            try:
-                                await bot.send_message(user_id, f"⚡️ *Оновлення графіку (Львів) для черги {q}*!", parse_mode=ParseMode.MARKDOWN)
+                            try: await bot.send_message(user_id, text, parse_mode=ParseMode.MARKDOWN)
                             except: pass
-                    
                     await save_schedule_state(lviv_q_id, data_hash)
         except Exception as e:
             logging.error(f"Error in lviv_scheduled_checker: {e}")
-        
         await asyncio.sleep(CHECK_INTERVAL)
 
 # --- АПІ ПАРСИНГ ---
-async def fetch_schedule(session: AsyncSession, queue_id):
+async def fetch_schedule(session, queue_id):
     if not APQE_PQFRTY: return None
     params = {"queue": queue_id}
     try:
@@ -247,16 +275,10 @@ def _parse_lviv_html(html: str) -> tuple[str | None, dict]:
 async def main():
     logging.info("🤖 Bot starting...")
     await init_db()
-    
-    # Запуск моніторингу
     asyncio.create_task(scheduled_checker())
     asyncio.create_task(lviv_scheduled_checker())
-    
-    try:
-        # await start_web_server() # Для швидкості тут опустимо якщо не треба
-        await dp.start_polling(bot)
-    finally:
-        await close_db()
+    try: await dp.start_polling(bot)
+    finally: await close_db()
 
 if __name__ == "__main__":
     asyncio.run(main())
