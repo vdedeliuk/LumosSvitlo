@@ -4,6 +4,7 @@ import os
 import re
 import requests
 from bs4 import BeautifulSoup
+from datetime import datetime
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -41,6 +42,9 @@ PROXY_URL = os.getenv("PROXY_URL")
 
 LVIV_API_URL = os.getenv("APQE_LOE")
 LVIV_POWER_API_URL = os.getenv("APWR_LOE")
+
+REGION_IF = "if"
+REGION_LVIV = "lviv"
 
 QUEUES = [
     "1.1", "1.2", "2.1", "2.2", "3.1", "3.2",
@@ -81,10 +85,10 @@ async def close_db():
 async def get_user_data(user_id: int) -> dict | None:
     return await db.users.find_one({"user_id": user_id})
 
-async def set_user_data(user_id: int, queues: list[str], address: str = None):
+async def set_user_data(user_id: int, queues: list[str], address: str = None, region: str = REGION_IF):
     await db.users.update_one(
         {"user_id": user_id},
-        {"$set": {"queues": queues, "address": address, "region": "if"}},
+        {"$set": {"queues": queues, "address": address, "region": region, "updated_at": datetime.now()}},
         upsert=True,
     )
 
@@ -94,10 +98,15 @@ async def get_users_count() -> int:
     except:
         return 0
 
-# --- FSM СТАНИ ---
+# --- FSM СТАНИ (LUM-7) ---
 class AddressForm(StatesGroup):
     waiting_for_city = State()
     waiting_for_street = State()
+    waiting_for_house = State()
+
+class LvivAddressForm(StatesGroup):
+    waiting_for_city_search = State()
+    waiting_for_street_search = State()
     waiting_for_house = State()
 
 # --- КЛАВІАТУРИ ---
@@ -108,6 +117,14 @@ def get_main_keyboard(has_queue: bool = False) -> ReplyKeyboardMarkup:
         [KeyboardButton(text=queue_btn), KeyboardButton(text=BTN_HELP)],
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+def get_region_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🏔 Івано-Франківська обл.", callback_data="region_if")],
+            [InlineKeyboardButton(text="🦁 Львівська обл.", callback_data="region_lviv")],
+        ]
+    )
 
 def get_queue_choice_keyboard() -> InlineKeyboardMarkup:
     buttons = [
@@ -167,51 +184,44 @@ def extract_queue_from_response(data) -> tuple[str | None, list | None]:
             return queue_id, schedule
     return None, None
 
-# --- ЛЬВІВСЬКА ОБЛАСТЬ (LUM-6) ---
-def _parse_lviv_html(html: str) -> tuple[str | None, dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(separator=" ", strip=True)
-    text = re.sub(r"\s+", " ", text)
-    date_match = re.search(r"\b(\d{2}\.\d{2}\.\d{4})\b", text)
-    date_str = date_match.group(1) if date_match else None
-    result = {}
-    for g in QUEUES:
-        pattern = rf"Група\s*{re.escape(g)}\b(.*?)(?=Група|$)"
-        m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-        if not m:
-            continue
-        group_text = m.group(1)
-        times = re.findall(r"(\d{2}:\d{2})\s*(?:-|–|до|to)\s*(\d{2}:\d{2})", group_text)
-        result[g] = times
-    return date_str, result
-
-async def fetch_lviv_schedule() -> dict | None:
-    """Використовує requests для отримання даних з ЛОЕ"""
-    if not LVIV_API_URL:
-        return None
+# --- ЛЬВІВСЬКА ОБЛАСТЬ (LUM-7) ---
+def _search_lviv_cities_sync(name_part: str) -> list[dict]:
     try:
-        # requests є синхронним, тому запускаємо в окремому потоці для асинхронності
-        loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(None, lambda: requests.get(LVIV_API_URL, timeout=15))
+        resp = requests.get(f"{LVIV_POWER_API_URL}/pw_cities", params={"name": name_part, "pagination": "false"}, timeout=10)
         resp.raise_for_status()
-        data = resp.json()
-        member = data.get("hydra:member") or []
-        if not member:
-            return {}
-        menu_items = member[0].get("menuItems", [])
-        all_schedules = {}
-        for item in menu_items:
-            name = item.get("name", "")
-            html = item.get("rawHtml")
-            if not html:
-                continue
-            if name in ("Today", "Tomorrow") or "графік" in name.lower():
-                date_str, groups = _parse_lviv_html(html)
-                if date_str and groups:
-                    all_schedules[date_str] = groups
-        return all_schedules
+        results = []
+        for item in resp.json().get("hydra:member", []):
+            results.append({"id": item["id"], "name": item["name"], "otg": item.get("otg", {}).get("name", "")})
+        return results
     except Exception as e:
-        logging.error(f"[ЛОЕ] Error fetching Lviv schedule: {e}")
+        logging.error(f"[ЛОЕ] Error searching Lviv cities: {e}")
+        return []
+
+def _search_lviv_streets_sync(city_id: int, name_part: str) -> list[dict]:
+    try:
+        resp = requests.get(f"{LVIV_POWER_API_URL}/pw_streets", params={"city.id": city_id, "name": name_part, "pagination": "false"}, timeout=10)
+        resp.raise_for_status()
+        results = []
+        for item in resp.json().get("hydra:member", []):
+            results.append({"id": item["id"], "name": item["name"]})
+        return results
+    except Exception as e:
+        logging.error(f"[ЛОЕ] Error searching Lviv streets: {e}")
+        return []
+
+def _find_lviv_group_sync(city_id: int, street_id: int, house: str) -> str | None:
+    try:
+        resp = requests.get(f"{LVIV_POWER_API_URL}/pw_accounts", params={"city.id": city_id, "street.id": street_id, "buildingName": house, "pagination": "false"}, timeout=10)
+        resp.raise_for_status()
+        members = resp.json().get("hydra:member", [])
+        if not members:
+            return None
+        raw = members[0].get("chergGpv")
+        if raw and len(raw) == 2 and raw.isdigit():
+            return f"{raw[0]}.{raw[1]}"
+        return raw
+    except Exception as e:
+        logging.error(f"[ЛОЕ] Error finding Lviv group: {e}")
         return None
 
 # --- ХЕНДЛЕРИ ---
@@ -223,8 +233,70 @@ async def cmd_start(message: Message):
         has_queue = False
     else:
         has_queue = len(user_data.get("queues", [])) > 0
-    text = f"💡 *Привіт, {message.from_user.first_name}!*\n\nТепер додано підтримку Львівської області (парсинг)."
+    text = f"💡 *Привіт, {message.from_user.first_name}!*\n\nЯ *Люмос*. Тепер ти можеш шукати свою чергу і в Львівській області!"
     await message.answer(text, reply_markup=get_main_keyboard(has_queue), parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(F.text == BTN_SET_QUEUE)
+async def handle_set_queue(message: Message):
+    await message.answer("Обери свою область:", reply_markup=get_region_keyboard())
+
+@dp.callback_query(F.data == "region_if")
+async def process_region_if(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Івано-Франківська обл. Обрано. Обери спосіб:", reply_markup=get_queue_choice_keyboard())
+
+@dp.callback_query(F.data == "region_lviv")
+async def process_region_lviv(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Львівська обл. Обрано. Обери спосіб:", reply_markup=get_queue_choice_keyboard())
+
+@dp.callback_query(F.data == "enter_address")
+async def process_enter_address(callback: CallbackQuery, state: FSMContext):
+    # Тут логіка залежить від обраного регіону (спрощено: якщо Львів обрано у повідомленні)
+    if "Львів" in callback.message.text:
+        await callback.message.edit_text("Введіть назву населеного пункту (Львівська обл):", reply_markup=get_cancel_keyboard())
+        await state.set_state(LvivAddressForm.waiting_for_city_search)
+    else:
+        await callback.message.edit_text("Введіть місто (Івано-Франківська обл):", reply_markup=get_cancel_keyboard())
+        await state.set_state(AddressForm.waiting_for_city)
+
+# ... (хендлери для IF) ...
+
+@dp.message(LvivAddressForm.waiting_for_city_search)
+async def lviv_city_search(message: Message, state: FSMContext):
+    loop = asyncio.get_event_loop()
+    cities = await loop.run_in_executor(None, lambda: _search_lviv_cities_sync(message.text))
+    if not cities:
+        await message.answer("❌ Міст не знайдено. Спробуйте ще раз:")
+        return
+    # Спрощено: беремо перше
+    city = cities[0]
+    await state.update_data(city_id=city["id"], city_name=city["name"])
+    await message.answer(f"✅ Обрано: {city['name']} ({city['otg']})\nВведіть назву вулиці:", reply_markup=get_cancel_keyboard())
+    await state.set_state(LvivAddressForm.waiting_for_street_search)
+
+@dp.message(LvivAddressForm.waiting_for_street_search)
+async def lviv_street_search(message: Message, state: FSMContext):
+    data = await state.get_data()
+    loop = asyncio.get_event_loop()
+    streets = await loop.run_in_executor(None, lambda: _search_lviv_streets_sync(data["city_id"], message.text))
+    if not streets:
+        await message.answer("❌ Вулиць не знайдено. Спробуйте ще раз:")
+        return
+    street = streets[0]
+    await state.update_data(street_id=street["id"], street_name=street["name"])
+    await message.answer(f"✅ Обрано: {street['name']}\nВведіть номер будинку:", reply_markup=get_cancel_keyboard())
+    await state.set_state(LvivAddressForm.waiting_for_house)
+
+@dp.message(LvivAddressForm.waiting_for_house)
+async def lviv_house_input(message: Message, state: FSMContext):
+    data = await state.get_data()
+    loop = asyncio.get_event_loop()
+    group = await loop.run_in_executor(None, lambda: _find_lviv_group_sync(data["city_id"], data["street_id"], message.text))
+    if group:
+        await set_user_data(message.from_user.id, [group], f"{data['city_name']}, {data['street_name']}, {message.text}", region=REGION_LVIV)
+        await message.answer(f"✅ Ваша черга (Львів): {group}!", reply_markup=get_main_keyboard(True))
+    else:
+        await message.answer("❌ Чергу не знайдено.")
+    await state.clear()
 
 # --- ВЕБ-СЕРВЕР ---
 async def handle_index(request):
